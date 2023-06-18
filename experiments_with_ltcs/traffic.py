@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Run on CPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Run on CPU
 
 import tensorflow as tf
 
@@ -36,6 +36,49 @@ def load_trace():
     return features, traffic_volume
 
 
+def load_bikes(predict_hour=1):
+    df = pd.read_csv("data/bicikelj/bicikelj_one.csv")
+    #holiday = (df["holiday"].values == None).astype(np.float32)
+    temp = df["temp_c"].values.astype(np.float32)
+    temp -= np.mean(temp)  # normalize temp by annual mean
+    rain = df["will_it_rain"].values.astype(np.float32)
+    #snow = df["snow_1h"].values.astype(np.float32)
+    clouds = df["cloud"].values.astype(np.float32)
+    date_time = df["date"].values
+    # 2012-10-02 13:00:00
+    date_time = [dt.datetime.strptime(d, "%Y-%m-%d %H:%M:%S") for d in date_time]
+    weekday = np.array([d.weekday() for d in date_time]).astype(np.float32)
+    noon = np.array([d.hour for d in date_time]).astype(np.float32)
+    noon = np.sin(noon * np.pi / 24)
+
+    hour_of_day = np.array([d.hour for d in date_time]).astype(np.float32)
+    day_of_week = np.array([d.weekday() for d in date_time]).astype(np.float32)
+
+    bikes_plus_120mins = df["bikes_plus_120mins"].values.astype(np.float32)
+    bikes_plus_60mins = df["bikes_plus_60mins"].values.astype(np.float32)
+
+
+    traffic_volume = df["value"].values.astype(np.float32)
+
+    prev_hour_bikes = np.zeros_like(traffic_volume)
+    prev_hour_bikes[1:] = traffic_volume[:-1]
+    prev_hour_bikes[0] = traffic_volume[0]
+
+
+
+    features = np.stack([temp, rain, clouds, weekday, hour_of_day,day_of_week,prev_hour_bikes,traffic_volume], axis=-1)
+
+    # traffic_volume -= np.mean(traffic_volume)  # normalize
+    # traffic_volume /= np.std(traffic_volume)  # normalize
+
+    #return date_time,features, traffic_volume
+    if predict_hour == 1:
+        return date_time,features, bikes_plus_60mins
+
+    elif predict_hour == 2:
+        return date_time,features, bikes_plus_120mins
+
+
 def cut_in_sequences(x, y, seq_len, inc=1):
 
     sequences_x = []
@@ -49,21 +92,42 @@ def cut_in_sequences(x, y, seq_len, inc=1):
 
     return np.stack(sequences_x, axis=1), np.stack(sequences_y, axis=1)
 
+import numpy as np
 
 class TrafficData:
-    def __init__(self, seq_len=32):
+    def __init__(self, seq_len=32, exclude_timestamps=None,predict_hour=1):
 
-        x, y = load_trace()
+        date_time, x, y = load_bikes(predict_hour=predict_hour)
+        date_time = np.array(date_time)
+        x = np.array(x)
+        y = np.array(y)
 
-        train_x, train_y = cut_in_sequences(x, y, seq_len, inc=4)
+        if exclude_timestamps is not None:
+            # Convert exclude_timestamps to datetime objects
+            exclude_timestamps = [dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") for ts in exclude_timestamps]
+
+            # Filter out the timestamps to be excluded
+            indices_to_keep = [i for i, dt in enumerate(date_time) if dt not in exclude_timestamps]
+            date_time = date_time[indices_to_keep]
+            x = x[indices_to_keep]
+            y = y[indices_to_keep]
+
+        train_x, train_y = cut_in_sequences(x, y, seq_len, inc=1)
+
+        print("train_x.shape: {}".format(train_x.shape))
+        print("train_y.shape: {}".format(train_y.shape))
+
+        print("train_x[0]: {}".format(train_x[0]))
+        print("train_y[0]: {}".format(train_y[0]))
+
 
         self.train_x = np.stack(train_x, axis=0)
         self.train_y = np.stack(train_y, axis=0)
         total_seqs = self.train_x.shape[1]
         print("Total number of training sequences: {}".format(total_seqs))
         permutation = np.random.RandomState(23489).permutation(total_seqs)
-        valid_size = int(0.1 * total_seqs)
-        test_size = int(0.15 * total_seqs)
+        valid_size = int(0.2 * total_seqs)
+        test_size = int(0.3 * total_seqs)
 
         self.valid_x = self.train_x[:, permutation[:valid_size]]
         self.valid_y = self.train_y[:, permutation[:valid_size]]
@@ -85,11 +149,12 @@ class TrafficData:
             yield (batch_x, batch_y)
 
 
+
 class TrafficModel:
     def __init__(self, model_type, model_size, learning_rate=0.001):
         self.model_type = model_type
         self.constrain_op = None
-        self.x = tf.placeholder(dtype=tf.float32, shape=[None, None, 7])
+        self.x = tf.placeholder(dtype=tf.float32, shape=[None, None, 8])
         self.target_y = tf.placeholder(dtype=tf.float32, shape=[None, None])
 
         self.model_size = model_size
@@ -263,6 +328,37 @@ class TrafficModel:
                 )
             )
 
+def predict_bikes(timestamp,predict_hour=1):
+    # Convert timestamp to datetime object
+    timestamp = dt.datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+
+    # Load the dataset
+    date_time,features, traffic_volume = load_bikes(predict_hour=predict_hour)
+
+    # Convert the dates in the dataset to datetime objects
+   
+
+    # Find the index of the closest hour that is not the current hour
+    diff = [abs((d - timestamp).total_seconds()) for d in date_time]
+    closest_index = np.argmin(diff)
+    if date_time[closest_index].hour == timestamp.hour:
+        diff[closest_index] = np.inf
+        closest_index = np.argmin(diff)
+        
+
+    # Compute the features for the closest hour
+    closest_features = features[closest_index]
+    # print(closest_features)
+    # print("closest time: ", date_time[closest_index])
+
+    # Reshape the features to match the input shape of the model
+    closest_features = np.reshape(closest_features, (1, 1, -1))
+
+    # Pass the features through the model to make a prediction
+    prediction = model.sess.run(model.y, {model.x: closest_features})
+
+
+    return prediction[0, 0, 0]
 
 if __name__ == "__main__":
 
@@ -273,7 +369,110 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", default=200, type=int)
     args = parser.parse_args()
 
-    traffic_data = TrafficData()
+    timestamps = [
+    "2022-08-04 23:24:00",
+    "2022-08-05 00:24:00",
+    "2022-08-08 04:58:00",
+    "2022-08-08 05:58:00",
+    "2022-08-11 21:13:00",
+    "2022-08-11 22:13:00",
+    "2022-08-16 07:10:00",
+    "2022-08-16 08:10:00",
+    "2022-08-18 17:30:00",
+    "2022-08-18 18:27:00",
+    "2022-08-21 11:07:00",
+    "2022-08-21 12:07:00",
+    "2022-08-24 15:09:00",
+    "2022-08-24 16:09:00",
+    "2022-08-29 03:05:00",
+    "2022-08-29 04:01:00",
+    "2022-08-31 06:37:00",
+    "2022-08-31 07:34:00",
+    "2022-09-03 15:48:00",
+    "2022-09-03 16:42:00",
+    "2022-09-05 18:34:00",
+    "2022-09-05 19:35:00",
+    "2022-09-08 07:44:00",
+    "2022-09-08 08:44:00",
+    "2022-09-10 05:50:00",
+    "2022-09-10 06:50:00",
+    "2022-09-12 09:32:00",
+    "2022-09-12 10:32:00",
+    "2022-09-17 18:25:00",
+    "2022-09-17 19:25:00",
+    "2022-09-20 23:43:00",
+    "2022-09-21 00:40:00",
+    "2022-09-23 13:36:00",
+    "2022-09-23 14:36:00",
+    "2022-09-26 07:09:00",
+    "2022-09-26 08:10:00",
+    "2022-09-29 03:14:00",
+    "2022-09-29 04:10:00",
+    "2022-10-01 19:27:00",
+    "2022-10-01 20:27:00",
+    ]
+
+    traffic_data = TrafficData(exclude_timestamps=timestamps,predict_hour=1)
     model = TrafficModel(model_type=args.model, model_size=args.size)
 
     model.fit(traffic_data, epochs=args.epochs, log_period=args.log)
+
+    model.restore()
+
+
+    predictions = []
+
+  
+    i = 0
+    for timestamp in timestamps:
+        # print("Predicting bikes for {}".format(timestamp))
+
+        if i % 2 == 0:
+            prediction = predict_bikes(timestamp,predict_hour=1)
+            predictions.append(prediction)
+
+
+        i += 1
+
+    print(predictions)
+
+    #reset the graph
+    tf.reset_default_graph()
+
+    traffic_data = TrafficData(exclude_timestamps=timestamps,predict_hour=2)
+    model = TrafficModel(model_type=args.model, model_size=args.size)
+    model.fit(traffic_data, epochs=args.epochs, log_period=args.log)
+    model.restore()
+
+    i = 0
+    for timestamp in timestamps:
+        # print("Predicting bikes for {}".format(timestamp))
+
+        if i % 2 == 0:
+           pass
+        else:
+            prediction = predict_bikes(timestamp,predict_hour=2)
+            predictions.append(prediction)
+
+        i += 1
+
+
+    print(predictions)
+
+    #save the predictions to txt
+    with open("predictions.txt", "w") as f:
+
+        for prediction in predictions:
+            f.write("{:0.8f}\n".format(prediction))
+
+    
+
+
+    
+
+
+
+
+    
+
+
